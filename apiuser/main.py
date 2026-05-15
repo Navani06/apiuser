@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+from typing import List
 import sqlite3
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,9 +31,24 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
             name    TEXT    NOT NULL,
-            age     INTEGER NOT NULL
+            age     INTEGER NOT NULL,
+            email   TEXT    NOT NULL DEFAULT '',
+            city    TEXT    NOT NULL DEFAULT '',
+            skills  TEXT    NOT NULL DEFAULT '[]'
         )
     """)
+    
+    # Check existing columns to apply migrations if needed
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col["name"] for col in cursor.fetchall()]
+    
+    if "email" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+    if "city" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN city TEXT NOT NULL DEFAULT ''")
+    if "skills" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'")
+
     conn.commit()
     conn.close()
 
@@ -44,17 +61,36 @@ init_db()
 class UserCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, example="John Doe")
     age: int  = Field(..., gt=0, lt=150, example=25)
+    email: str = Field(..., example="john@example.com")
+    city: str = Field(..., example="New York")
+    skills: List[str] = Field(..., example=["Python", "FastAPI"])
 
 
 class UserResponse(BaseModel):
     id: int
     name: str
     age: int
+    email: str
+    city: str
+    skills: List[str]
+
+
+class UserDetailResponse(BaseModel):
+    message: str
+    user_name: str
+    city: str
+    total_skills: int
+    user_data: UserResponse
 
 
 class SuccessResponse(BaseModel):
     message: str
     user: UserResponse
+
+
+class UserListResponse(BaseModel):
+    message: str
+    users: List[UserResponse]
 
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
@@ -69,51 +105,75 @@ def root():
 def create_user(user: UserCreateRequest):
     """
     Create a new user and store in SQLite database.
-
-    - **name**: Full name of the user (required)
-    - **age**: Age of the user, must be between 1 and 149 (required)
     """
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "INSERT INTO users (name, age) VALUES (?, ?)",
-        (user.name, user.age)
+        "INSERT INTO users (name, age, email, city, skills) VALUES (?, ?, ?, ?, ?)",
+        (user.name, user.age, user.email, user.city, json.dumps(user.skills))
     )
     conn.commit()
 
     user_id = cursor.lastrowid
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    new_user = cursor.fetchone()
+    new_user = dict(cursor.fetchone())
     conn.close()
+
+    new_user["skills"] = json.loads(new_user["skills"])
 
     return {
         "message": "User created successfully",
-        "user": dict(new_user)
+        "user": new_user
     }
 
 
-@app.get("/users/{user_id}", response_model=SuccessResponse, tags=["Users"])
+@app.get("/users", response_model=UserListResponse, tags=["Users"])
+def get_users_by_city(city: str = Query(..., description="Filter users by city")):
+    """
+    Filter users by city using query parameters.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM users WHERE city = ?", (city,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    users = []
+    for row in rows:
+        user = dict(row)
+        user["skills"] = json.loads(user["skills"])
+        users.append(user)
+
+    return {"message": "Users filtered successfully", "users": users}
+
+
+@app.get("/users/{user_id}", response_model=UserDetailResponse, tags=["Users"])
 def get_user(user_id: int):
     """
     Fetch a user by their ID from SQLite database.
-
-    - **user_id**: The integer ID of the user
     """
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    user = cursor.fetchone()
+    user_row = cursor.fetchone()
     conn.close()
 
-    if not user:
+    if not user_row:
         raise HTTPException(
             status_code=404,
             detail=f"User with ID '{user_id}' not found."
         )
 
+    user = dict(user_row)
+    user["skills"] = json.loads(user["skills"])
+
     return {
         "message": "User fetched successfully",
-        "user": dict(user)
+        "user_name": user["name"],
+        "city": user["city"],
+        "total_skills": len(user["skills"]),
+        "user_data": user
     }
